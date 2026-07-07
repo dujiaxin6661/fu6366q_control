@@ -45,6 +45,9 @@ typedef struct
 extern APPLYTypeDef xdata ApplyState;
 
 extern void ApplyFun_Conrtrol(void);
+extern void Apply_CAN_SetCommand(uint8 mode, uint8 flags, int16 target, int16 limit_ma, uint16 timeout_ms, uint8 seq);
+extern void Apply_CAN_Tick1ms(void);
+extern void Apply_CAN_GetStatus(uint8 *mode, uint8 *status, uint8 *seq, uint16 *age_ms);
 
 #endif
 

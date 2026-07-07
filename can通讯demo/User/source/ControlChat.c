@@ -1,23 +1,13 @@
-/**
- * ============================================================================
- * @file      ControlChat.c
- * @brief     CAN总线通信处理 —— 接收上位机指令并应答
- * @note      本文件处理CAN通信的应用层逻辑：
+/*
+ * CAN application layer.
  *
- *              CAN_Process() —— 在主循环中调用
- *              检查CAN接收标志(CAN_ResonFlag)，收到消息后将数据原样回传（echo）
- *              使用CAN_Send()发送8字节数据到IDNum指定的CAN ID
+ * RX:
+ *   0x200 command frame from PC/main controller.
+ *   0x001 legacy ping frame, echoed for link tests.
  *
- *              注意：这是原厂demo的极简实现（仅回传数据），实际产品中需要：
- *              - 解析CAN指令格式（如ID=0x200设置控制模式，ID=0x201设置目标值）
- *              - 根据指令调用对应的电机控制函数
- *              - 定期上报状态（速度/电流/角度/故障码）
- *
- *              全局变量（在CAN驱动中定义）：
- *              - CanRxdata.CAN_ResonFlag : 接收完成标志
- *              - IDNum                     : 要发送的CAN ID
- *              - CANdata[8]               : 发送数据缓冲区
- * ============================================================================
+ * TX:
+ *   0x180..0x183 telemetry frames.
+ *   0x184 command acknowledgement frame.
  */
 
 #include <Myproject.h>
@@ -28,11 +18,13 @@
 #define CAN_ID_BASELINE_FOC         (0x181)
 #define CAN_ID_BASELINE_ANGLE       (0x182)
 #define CAN_ID_BASELINE_SPEED       (0x183)
+#define CAN_ID_COMMAND_ACK          (0x184)
 
 static volatile uint8 data sg_ucTelemetryTick = 0;
 static volatile uint8 data sg_ucTelemetryPending = 0;
 static uint8 data sg_ucTelemetryFrame = 0;
 static uint8 xdata sg_ucTelemetryData[8];
+static uint8 xdata sg_ucAckData[8];
 static volatile uint16 data sg_uiIqAbsPeakRaw = 0;
 
 static void CAN_PackU16(uint8 index, uint16 value)
@@ -53,6 +45,21 @@ static uint16 CAN_AbsS16(int16 value)
         return (uint16)(-value);
     }
     return (uint16)value;
+}
+
+static int16 CAN_ReadS16(uint8 index)
+{
+    uint16 value;
+
+    value = (uint16)CanRxdata.Data[index];
+    value |= ((uint16)CanRxdata.Data[index + 1] << 8);
+    return (int16)value;
+}
+
+static void CAN_AckPackU16(uint8 index, uint16 value)
+{
+    sg_ucAckData[index] = (uint8)(value & 0x00FF);
+    sg_ucAckData[index + 1] = (uint8)(value >> 8);
 }
 
 void CAN_TelemetryTick1ms(void)
@@ -113,12 +120,19 @@ static void CAN_SendBaselineAngle(void)
 
 static void CAN_SendBaselineSpeed(void)
 {
+    uint8 can_mode;
+    uint8 can_status;
+    uint8 can_seq;
+    uint16 can_age;
+
+    Apply_CAN_GetStatus(&can_mode, &can_status, &can_seq, &can_age);
+
     CAN_PackS16(0, mcSpeedRamp.TargetValue);
     CAN_PackS16(2, mcSpeedRamp.ActualValue);
     sg_ucTelemetryData[4] = 0;
     sg_ucTelemetryData[5] = (uint8)mcFocCtrl.CtrlMode;
-    sg_ucTelemetryData[6] = 0;
-    sg_ucTelemetryData[7] = 0;
+    sg_ucTelemetryData[6] = can_mode;
+    sg_ucTelemetryData[7] = can_status;
 
     if(GP33 == 0)
     {
@@ -174,25 +188,67 @@ static void CAN_TelemetryProcess(void)
     sg_ucTelemetryPending--;
 }
 
-/**
- * @brief      CAN_Process() —— CAN通信应用层处理（由主循环每周期调用）
- * @note       当前功能：收到CAN消息后原样回传（echo/loopback测试）
- *              CAN_Send(IDNum, CANdata, 8) → 将8字节数据发送到IDNum
- *
- *              扩展建议：
- *              - 定义协议格式：bytes[0]=命令类型, bytes[1-2]=目标值(16位), bytes[3]=CRC
- *              - 命令类型：0x01=力矩控制, 0x02=速度控制, 0x03=位置控制
- *              - 状态上报：定时发送电机状态（速度/电流/角度/温度/故障码）
- */
+static void CAN_SendCommandAck(uint8 rx_seq)
+{
+    uint8 mode;
+    uint8 status;
+    uint8 applied_seq;
+    uint16 age_ms;
+
+    Apply_CAN_GetStatus(&mode, &status, &applied_seq, &age_ms);
+
+    sg_ucAckData[0] = mode;
+    sg_ucAckData[1] = status;
+    sg_ucAckData[2] = (uint8)mcFaultSource;
+    sg_ucAckData[3] = (uint8)mcState;
+    sg_ucAckData[4] = (uint8)mcFocCtrl.CtrlMode;
+    sg_ucAckData[5] = rx_seq;
+    CAN_AckPackU16(6, age_ms);
+    CAN_Send(CAN_ID_COMMAND_ACK, sg_ucAckData, 8);
+}
+
+static void CAN_HandleCommandFrame(void)
+{
+    uint8 mode;
+    uint8 flags;
+    uint8 seq;
+    uint16 timeout_ms;
+    int16 target;
+    int16 limit_ma;
+
+    if(CanRxdata.CAN_DLC < 8)
+    {
+        return;
+    }
+
+    mode = CanRxdata.Data[0];
+    flags = CanRxdata.Data[1];
+    target = CAN_ReadS16(2);
+    limit_ma = CAN_ReadS16(4);
+    timeout_ms = ((uint16)CanRxdata.Data[6]) * 50;
+    seq = CanRxdata.Data[7];
+
+    Apply_CAN_SetCommand(mode, flags, target, limit_ma, timeout_ms, seq);
+    CAN_SendCommandAck(seq);
+}
+
 void CAN_Process(void)
 {
-    if(CanRxdata.CAN_ResonFlag == 1)                     // ★ 有CAN消息到达
+    if(CanRxdata.CAN_ResonFlag == 1)
     {
-        CanRxdata.CAN_ResonFlag = 0;                     // 清除标志（允许接收下一条）
+        CanRxdata.CAN_ResonFlag = 0;
 
-        /* 原样回传：将接收到的8字节数据发送回主机 */
-        CAN_Send(IDNum, CANdata, 8);                     // IDNum=接收时的CAN ID, CANdata=8字节数据
-        return;
+        if(!CanRxdata.CAN_IDE && CanRxdata.CANID == CAN_COMMAND_ID)
+        {
+            CAN_HandleCommandFrame();
+            return;
+        }
+
+        if(!CanRxdata.CAN_IDE && CanRxdata.CANID == IDNum)
+        {
+            CAN_Send(IDNum, CanRxdata.Data, 8);
+            return;
+        }
     }
 
     CAN_TelemetryProcess();
