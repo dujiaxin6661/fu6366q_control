@@ -1,0 +1,29 @@
+# Keil generated files
+Objects/
+Listings/
+*.obj
+*.o
+*.lst
+*.map
+*.m51
+*.lnp
+*.crf
+*.d
+*.dep
+*.bak
+*.uvgui.*
+*.uvguix.*
+
+# Python cache / virtual env
+__pycache__/
+*.pyc
+.venv/
+.env
+
+# Logs / temp
+*.log
+*.tmp
+
+# Windows
+Thumbs.db
+desktop.ini
