@@ -27,7 +27,7 @@
 #define KEY_JOG_SPEED_RPM             (50)
 #define KEY_JOG_IQ_LIMIT_A            (0.5)
 
-#define CAN_DEFAULT_TIMEOUT_MS        (200)
+#define CAN_DEFAULT_TIMEOUT_MS        (200)     // 200 ms
 #define CAN_MIN_TIMEOUT_MS            (50)
 #define CAN_MAX_TIMEOUT_MS            (5000)
 #define CAN_DEFAULT_IQ_LIMIT_MA       (500)
@@ -235,6 +235,7 @@ static void Apply_DisableOutput(void)
     s_lastJogActive = 0;
 }
 
+// 真正的电机控制函数
 static void Apply_ExecuteCanCommand(void)
 {
     int16 limit_ma;
@@ -377,28 +378,33 @@ static void Apply_KeyFallbackControl(void)
     }
 }
 
+/*
+只负责“接收并登记命令”，不直接控制电机。
+*/ 
 void Apply_CAN_SetCommand(uint8 mode, uint8 flags, int16 target, int16 limit_ma, uint16 timeout_ms, uint8 seq)
 {
     if(timeout_ms == 0)
     {
-        timeout_ms = CAN_DEFAULT_TIMEOUT_MS;
+        timeout_ms = CAN_DEFAULT_TIMEOUT_MS;   // 上位机发送0时，不表示永不超时，而是使用默认值 200ms。
     }
     else if(timeout_ms < CAN_MIN_TIMEOUT_MS)
     {
-        timeout_ms = CAN_MIN_TIMEOUT_MS;
+        timeout_ms = CAN_MIN_TIMEOUT_MS;       // 低于 50ms 时强制改成 50ms，避免上位机稍有延迟就误触发超时。
     }
     else if(timeout_ms > CAN_MAX_TIMEOUT_MS)
     {
-        timeout_ms = CAN_MAX_TIMEOUT_MS;
+        timeout_ms = CAN_MAX_TIMEOUT_MS;	   // 大于 5000ms 时限制为 5000ms，防止通信已经断开，电机还长时间保持旧的速度或电流命令。
     }
 
+	// 保存数据到内部变量
     s_canMode = mode;
     s_canFlags = flags;
     s_canTarget = target;
     s_canLimitMa = limit_ma;
     s_canTimeoutMs = timeout_ms;
     s_canSeq = seq;
-    s_canAgeMs = 0;
+	
+    s_canAgeMs = 0;           // 表示距离最近一次有效命令过去了多少毫秒。
     s_canTimeoutLatch = 0;
 
     if(flags & CAN_FLAG_ENABLE)
@@ -421,6 +427,7 @@ void Apply_CAN_SetCommand(uint8 mode, uint8 flags, int16 target, int16 limit_ma,
     }
 }
 
+// 超时函数，速度模式设置 5000ms 后，如果5秒内没有新命令：自动刹停
 void Apply_CAN_Tick1ms(void)
 {
     if(s_canActive)
@@ -436,12 +443,15 @@ void Apply_CAN_Tick1ms(void)
     }
 }
 
+/*
+它不改变控制状态，只负责读取并打包状态。
+*/
 void Apply_CAN_GetStatus(uint8 *mode, uint8 *status, uint8 *seq, uint16 *age_ms)
 {
     uint8 state;
-
-    state = 0;
-    if(Apply_IsReady())
+    state = 0;   // 清空状态字节，state 是8位状态字，每一位表示一种状态。
+	
+    if(Apply_IsReady())   // 如果MR传感器校准完成并且电机控制状态机进入 mcRun，就state |= 0x01 表示把 bit0 设置为1，同时不影响其他位。
     {
         state |= APPLY_CAN_STATUS_READY;
     }
